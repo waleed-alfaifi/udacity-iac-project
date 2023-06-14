@@ -1,0 +1,195 @@
+Description: EC2 and load balancer part of the project
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: Udagram
+  InstanceType:
+    Description: AppServer EC2 instance type
+    Type: String
+    Default: t2.medium # 2 vCPU, 4 GiB RAM
+  InstanceAMI:
+    Description: AppServer EC2 instance AMI
+    Type: AWS::EC2::Image::Id
+    Default: ami-053b0d53c279acc90 # Canonical, Ubuntu, 22.04 LTS, amd64 jammy image build on 2023-05-16
+  LoadBalancerScheme:
+    Description: Load balancer scheme
+    Type: String
+    Default: internet-facing
+  LoadBalancerType:
+    Description: Load balancer type
+    Type: String
+    Default: application
+  BastionHostKeyName:
+    Description: The EC2 Key Pair to allow SSH access to the bastion host. For simplicity, we also use it for the instances.
+    Type: String
+    Default: None
+Conditions:
+  IsBastionHostKeyNameExist:
+    Fn::Not:
+      - Fn::Equals:
+          - !Ref BastionHostKeyName
+          - "None"
+Resources:
+  # create a security group for the ec2 instance launched by the autoscaling group
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access and HTTP access inside the VPC only
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.0.0.0/16
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access for load balancer
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+  # create a launch template for instances
+  AppServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${EnvironmentName}-AppServerLaunchTemplate
+      LaunchTemplateData:
+        ImageId: !Ref InstanceAMI
+        InstanceType: !Ref InstanceType
+        KeyName:
+          Fn::If:
+            - IsBastionHostKeyNameExist
+            - !Ref BastionHostKeyName
+            - !Ref AWS::NoValue
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1 # root device
+            Ebs:
+              VolumeSize: 10 # 10 GB
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            apt-get update -y
+            apt-get install apache2 -y
+            systemctl start apache2.service
+            git clone https://github.com/waleed-alfaifi/udacity-static-hosting.git repo
+            sudo cp -r repo/dist/invoice-app/* /var/www/html
+  # create a target group for the load balancer
+  AppServerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-AppServerTargetGroup
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      HealthCheckIntervalSeconds: 240
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 120
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 4
+      TargetType: instance
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-AppServerTargetGroup
+  # create an autoscaling group with min 1 instance and max 4 instances
+  AppServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${EnvironmentName}-AppServerAutoScalingGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppServerLaunchTemplate
+        Version: !GetAtt AppServerLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 4
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref AppServerTargetGroup
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-AppServerAutoScalingGroup
+          PropagateAtLaunch: true
+  # create a load balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: !Ref LoadBalancerType
+      Scheme: !Ref LoadBalancerScheme
+      Subnets:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet1
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-Loadbalancer
+  # create a load balancer listener (http listener)
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppServerTargetGroup
+  # create a bastion host to access the instances
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Condition: IsBastionHostKeyNameExist
+    Properties:
+      ImageId: ami-04a0ae173da5807d3 # Amazon Linux 2023 AMI 2023.0.20230607.0 x86_64 HVM kernel-6.1
+      InstanceType: t1.micro
+      KeyName: !Ref BastionHostKeyName
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      SubnetId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-BastionHost
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: IsBastionHostKeyNameExist
+    Properties:
+      GroupDescription: Enable SSH access
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+Outputs:
+  LoadBalancer:
+    Description: The ID of the load balancer
+    Value: !Ref LoadBalancer
+  LoadBalancerDNSName:
+    Description: The DNS name of the load balancer
+    Value: !GetAtt LoadBalancer.DNSName
+  LoadBalancerURL:
+    Description: The URL of the load balancer
+    Value: !Sub http://${LoadBalancer.DNSName}/
+  AppServerLaunchTemplateId:
+    Description: The ID of the launch template
+    Value: !Ref AppServerLaunchTemplate
